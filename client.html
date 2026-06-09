@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FlashHead × Gemini — Live Avatar</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+    background: #0b0d12; color: #e7e9ee;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  h1 { font-size: 16px; font-weight: 600; letter-spacing: .3px; margin: 0; opacity: .85; }
+  #stage {
+    position: relative; width: 512px; max-width: 92vw; aspect-ratio: 1 / 1;
+    border-radius: 16px; overflow: hidden; background: #15181f;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  }
+  #frame { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .controls { display: flex; gap: 12px; align-items: center; }
+  button {
+    appearance: none; border: 0; border-radius: 10px; padding: 11px 20px;
+    font-size: 14px; font-weight: 600; cursor: pointer; transition: .15s;
+    background: #3b82f6; color: white;
+  }
+  button:hover { background: #2f6fe0; }
+  button:disabled { background: #2a2f3a; color: #6b7280; cursor: not-allowed; }
+  button.stop { background: #ef4444; }
+  button.stop:hover { background: #dc2626; }
+  .stats {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; color: #8b93a3; min-height: 16px; letter-spacing: .2px;
+  }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#6b7280; margin-right:6px; vertical-align:middle; }
+  .dot.on { background:#22c55e; }
+  .dot.err { background:#ef4444; }
+</style>
+</head>
+<body>
+  <h1>FlashHead × Gemini — Live Avatar</h1>
+
+  <div id="stage">
+    <img id="frame" alt="avatar" />
+    <video id="clipVideoA" style="display:none; position:absolute; inset:0; width:100%; height:100%; object-fit:cover;" playsinline></video>
+    <video id="clipVideoB" style="display:none; position:absolute; inset:0; width:100%; height:100%; object-fit:cover;" playsinline></video>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" class="stop" disabled>Stop</button>
+  </div>
+
+  <div class="stats"><span id="dot" class="dot"></span><span id="status">idle</span></div>
+  <div class="stats" id="metrics"></div>
+
+<script>
+/* ============================================================================
+ * Config — must match the server's wire protocol.
+ *   - mic out: 16kHz PCM int16, binary frames
+ *   - in: first byte 0x01 = JPEG video frame, 0x02 = 24kHz PCM audio
+ * ==========================================================================*/
+const MIC_SAMPLE_RATE   = 16000;   // server expects 16k mic PCM
+const GEMINI_SAMPLE_RATE = 24000;  // server sends 24k audio (Gemini)
+const TARGET_FPS        = 25;      // FlashHead fixed output fps
+const FRAME_INTERVAL_MS = 1000 / TARGET_FPS;  // 40ms
+
+// Jitter buffer: hold this many frames before starting playback. Larger =
+// smoother against bursty generation, but more latency. ~0.5s at 25fps = 12.
+const JITTER_PREBUFFER_FRAMES = 6;
+// If the buffer overflows wildly (generation way ahead), cap memory.
+const MAX_BUFFER_FRAMES = 250;
+
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let micProcessor = null;
+let micSource = null;
+let running = false;
+
+/* ---- video jitter buffer ---------------------------------------------------
+ * Frames arrive in clumps (28 at once, then a gap). We DON'T paint them on
+ * arrival (that's the bursty/"bad internet" look). Instead we queue the decoded
+ * blobs and a requestAnimationFrame loop paints one every ~40ms => steady 25fps
+ * regardless of how clumped the network delivery is.
+ * ------------------------------------------------------------------------- */
+const frameBuffer = [];     // array of object URLs (decoded JPEG blobs)
+let playing = false;
+let lastPaintTs = 0;
+let framesShown = 0;
+let framesReceived = 0;
+
+const imgEl = document.getElementById('frame');
+const statusEl = document.getElementById('status');
+const metricsEl = document.getElementById('metrics');
+const dotEl = document.getElementById('dot');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+
+function setStatus(text, state) {
+  statusEl.textContent = text;
+  dotEl.className = 'dot' + (state === 'on' ? ' on' : state === 'err' ? ' err' : '');
+}
+
+function pushVideoFrame(jpegBytes) {
+  framesReceived++;
+  const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+  const url = URL.createObjectURL(blob);
+  frameBuffer.push(url);
+  // Memory guard: if we somehow run far ahead, drop oldest (rare).
+  while (frameBuffer.length > MAX_BUFFER_FRAMES) {
+    const old = frameBuffer.shift();
+    URL.revokeObjectURL(old);
+  }
+  // Start playback once we've buffered enough for smoothness.
+  if (!playing && frameBuffer.length >= JITTER_PREBUFFER_FRAMES) {
+    playing = true;
+    lastPaintTs = performance.now();
+    requestAnimationFrame(paintLoop);
+  }
+}
+
+function paintLoop(ts) {
+  if (!running) { playing = false; return; }
+  const elapsed = ts - lastPaintTs;
+  if (elapsed >= FRAME_INTERVAL_MS) {
+    if (frameBuffer.length > 0) {
+      const url = frameBuffer.shift();
+      // Revoke the PREVIOUS object URL after the new one is set (avoid fl/blank).
+      const prev = imgEl.dataset.url;
+      imgEl.onload = () => { if (prev) URL.revokeObjectURL(prev); };
+      imgEl.src = url;
+      imgEl.dataset.url = url;
+      framesShown++;
+      // Keep cadence steady; if we fell behind by multiple intervals, don't
+      // try to catch up by bursting — just realign (smooth > low-latency).
+      lastPaintTs = ts;
+    } else {
+      // Buffer underran (generation gap longer than buffer). Hold last frame,
+      // and re-arm prebuffer so we don't show a single stuttery frame.
+      playing = false;
+      return;
+    }
+  }
+  requestAnimationFrame(paintLoop);
+}
+
+/* ---- audio playback queue --------------------------------------------------
+ * Server sends 24kHz PCM int16 (Gemini's voice). We queue and schedule each
+ * chunk back-to-back so speech is continuous.
+ * ------------------------------------------------------------------------- */
+let audioPlayhead = 0;  // next start time in the AudioContext clock
+
+function playAudioChunk(int16) {
+  if (!audioCtx) return;
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+  const buf = audioCtx.createBuffer(1, f32.length, GEMINI_SAMPLE_RATE);
+  buf.copyToChannel(f32, 0);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  if (audioPlayhead < now) audioPlayhead = now;  // catch up if we fell behind
+  src.start(audioPlayhead);
+  audioPlayhead += buf.duration;
+}
+
+/* ---- clips mode: double-buffered gapless MP4 player -------------------------
+ * Two <video> elements. The playing element shows the current clip; the other
+ * preloads (decodes) the next clip so the swap on 'ended' is gap-free. A small
+ * lead buffer ensures a clip is ready before the current one finishes.
+ * ------------------------------------------------------------------------- */
+const clipQueue = [];           // object URLs waiting to play (not yet assigned)
+let clipsReceived = 0;
+let clipStarted = false;
+const CLIP_LEAD = 1;            // start as soon as 1 clip is buffered (low latency)
+const vids = [document.getElementById('clipVideoA'),
+              document.getElementById('clipVideoB')];
+let activeVid = 0;
+let preloadedUrl = null;        // url currently preloaded into the inactive element
+
+function enqueueClip(mp4Bytes) {
+  if (vids[0].style.display === 'none' && vids[1].style.display === 'none') {
+    document.getElementById('frame').style.display = 'none';
+  }
+  const blob = new Blob([mp4Bytes], { type: 'video/mp4' });
+  clipQueue.push(URL.createObjectURL(blob));
+  clipsReceived++;
+  if (!clipStarted && clipQueue.length >= CLIP_LEAD) {
+    clipStarted = true;
+    playOn(activeVid, clipQueue.shift());
+  }
+  // Opportunistically preload into the inactive element if idle.
+  maybePreload();
+}
+
+function maybePreload() {
+  if (!clipStarted) return;
+  const other = vids[1 - activeVid];
+  if (!preloadedUrl && clipQueue.length > 0) {
+    preloadedUrl = clipQueue.shift();
+    other.src = preloadedUrl;
+    other.load();
+  }
+}
+
+function playOn(idx, url) {
+  const el = vids[idx];
+  el.src = url;
+  el.style.display = 'block';
+  el.currentUrl = url;
+  el.play().catch(() => {});
+  maybePreload();   // start decoding the next one into the other element
+  el.onended = () => {
+    el.onended = null;
+    el.style.display = 'none';
+    if (el.currentUrl) { URL.revokeObjectURL(el.currentUrl); el.currentUrl = null; }
+    el.removeAttribute('src');
+    // Swap to the preloaded element if ready; else wait for next arrival.
+    if (preloadedUrl) {
+      const nextUrl = preloadedUrl;
+      preloadedUrl = null;
+      activeVid = 1 - idx;
+      const nxt = vids[activeVid];
+      nxt.style.display = 'block';
+      nxt.currentUrl = nextUrl;
+      nxt.play().catch(() => {});
+      maybePreload();
+      // re-arm ended on the new active element
+      playContinue(activeVid);
+    } else if (clipQueue.length > 0) {
+      activeVid = 1 - idx;
+      playOn(activeVid, clipQueue.shift());
+    } else {
+      clipStarted = false;   // ran dry; next enqueue restarts
+    }
+  };
+}
+
+// Re-arm the 'ended' handler for an element already playing a preloaded clip.
+function playContinue(idx) {
+  const el = vids[idx];
+  el.onended = () => {
+    el.onended = null;
+    el.style.display = 'none';
+    if (el.currentUrl) { URL.revokeObjectURL(el.currentUrl); el.currentUrl = null; }
+    el.removeAttribute('src');
+    if (preloadedUrl) {
+      const nextUrl = preloadedUrl;
+      preloadedUrl = null;
+      activeVid = 1 - idx;
+      const nxt = vids[activeVid];
+      nxt.style.display = 'block';
+      nxt.currentUrl = nextUrl;
+      nxt.play().catch(() => {});
+      maybePreload();
+      playContinue(activeVid);
+    } else if (clipQueue.length > 0) {
+      activeVid = 1 - idx;
+      playOn(activeVid, clipQueue.shift());
+    } else {
+      clipStarted = false;
+    }
+  };
+}
+
+/* ---- metrics + latency ping ------------------------------------------------*/
+let lastRttMs = null;
+
+// Send a ping every second; server echoes it; onmessage computes round trip.
+setInterval(() => {
+  if (running && ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ t: performance.now() })); } catch (e) {}
+  }
+}, 1000);
+
+setInterval(() => {
+  if (!running) { metricsEl.textContent = ''; return; }
+  const rtt = lastRttMs === null ? '—' : `${lastRttMs}ms`;
+  metricsEl.textContent =
+    `recv ${framesReceived}  shown ${framesShown}  buffer ${frameBuffer.length}  net ${rtt}` +
+    (clipsReceived ? `  clips ${clipsReceived}(q${clipQueue.length})` : '');
+}, 500);
+
+/* ---- mic capture -----------------------------------------------------------
+ * Capture mic, downsample to 16kHz, send int16 PCM binary over the WebSocket.
+ * ------------------------------------------------------------------------- */
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+  });
+  micSource = audioCtx.createMediaStreamSource(micStream);
+
+  // ScriptProcessor is deprecated but universally supported and simplest here.
+  const BUF = 4096;
+  micProcessor = audioCtx.createScriptProcessor(BUF, 1, 1);
+  const inRate = audioCtx.sampleRate;          // usually 48000
+  const ratio = inRate / MIC_SAMPLE_RATE;      // e.g. 3.0
+
+  micProcessor.onaudioprocess = (e) => {
+    if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const input = e.inputBuffer.getChannelData(0);
+    // Downsample to 16k by simple decimation/averaging.
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const idx = i * ratio;
+      const lo = Math.floor(idx);
+      let s = input[lo] || 0;
+      s = Math.max(-1, Math.min(1, s));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    ws.send(out.buffer);
+  };
+
+  micSource.connect(micProcessor);
+  micProcessor.connect(audioCtx.destination);  // required for the node to run
+}
+
+/* ---- connection lifecycle --------------------------------------------------*/
+async function start() {
+  if (running) return;
+  startBtn.disabled = true;
+  setStatus('connecting…', null);
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  audioPlayhead = audioCtx.currentTime;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    running = true;
+    setStatus('live', 'on');
+    stopBtn.disabled = false;
+    try { await startMic(); }
+    catch (err) { setStatus('mic error: ' + err.message, 'err'); stop(); }
+  };
+
+  ws.onmessage = (ev) => {
+    // Text frame = ping echo (for latency). Binary = video/audio.
+    if (typeof ev.data === 'string') {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.t) {
+          lastRttMs = Math.round(performance.now() - msg.t);
+        }
+      } catch (e) {}
+      return;
+    }
+    const data = new Uint8Array(ev.data);
+    if (data.length < 1) return;
+    const kind = data[0];
+    if (kind === 0x01) {
+      const jpeg = data.slice(1);   // .slice COPIES (unlike subarray)
+      pushVideoFrame(jpeg);
+    } else if (kind === 0x02) {
+      const audioBytes = data.slice(1);            // copy -> fresh aligned buffer
+      const int16 = new Int16Array(
+        audioBytes.buffer, audioBytes.byteOffset,
+        Math.floor(audioBytes.byteLength / 2)
+      );
+      playAudioChunk(int16);
+    } else if (kind === 0x03) {
+      // MP4 clip (clips mode): queue and play sequentially via <video>.
+      const mp4 = data.slice(1);
+      enqueueClip(mp4);
+    }
+  };
+
+  ws.onerror = () => setStatus('ws error', 'err');
+  ws.onclose = () => { if (running) { setStatus('disconnected', 'err'); stop(); } };
+}
+
+function stop() {
+  running = false;
+  playing = false;
+  stopBtn.disabled = true;
+  startBtn.disabled = false;
+  setStatus('idle', null);
+
+  try { micProcessor && micProcessor.disconnect(); } catch (e) {}
+  try { micSource && micSource.disconnect(); } catch (e) {}
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { ws && ws.close(); } catch (e) {}
+
+  // Clear video buffer + free object URLs.
+  while (frameBuffer.length) { URL.revokeObjectURL(frameBuffer.shift()); }
+  if (imgEl.dataset.url) { URL.revokeObjectURL(imgEl.dataset.url); imgEl.dataset.url = ''; }
+
+  micProcessor = micSource = micStream = ws = null;
+}
+
+startBtn.addEventListener('click', start);
+stopBtn.addEventListener('click', stop);
+</script>
+</body>
+</html>
