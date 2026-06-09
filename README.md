@@ -23,7 +23,7 @@ This repo has three pieces:
 
 ## Quick start
 
-On a fresh GPU pod (RTX 3090 Ti / 4090 class, CUDA 12.8, Python 3.11):
+On a fresh GPU pod (RTX 3090 Ti / 4090 class, CUDA 12.8, Python 3.11) or your local server:
 
 ```bash
 # 1. run the installer (clones repo, installs everything, downloads models)
